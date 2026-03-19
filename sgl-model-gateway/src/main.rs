@@ -1182,12 +1182,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => cli.router_args,
     };
 
-    // Automatically enable IGW mode when service discovery is turned on
-    if cli_args.service_discovery && !cli_args.enable_igw {
-        println!("INFO: IGW mode automatically enabled because service discovery is turned on");
-        cli_args.enable_igw = true;
-    }
-
     println!("SGLang Router starting...");
     println!("Host: {}:{}", cli_args.host, cli_args.port);
     let mode_str = if cli_args.enable_igw {
