@@ -13,7 +13,7 @@ use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use super::pd_types::api_path;
 use crate::{
@@ -52,6 +52,7 @@ pub struct PDRouter {
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
     pub enable_igw: bool,
+    pub decode_only_routing: bool,
 }
 
 #[derive(Clone)]
@@ -165,6 +166,13 @@ impl PDRouter {
             retry_config: ctx.router_config.effective_retry_config(),
             api_key: ctx.router_config.api_key.clone(),
             enable_igw: ctx.router_config.enable_igw,
+            decode_only_routing: matches!(
+                &ctx.router_config.mode,
+                crate::config::types::RoutingMode::PrefillDecode {
+                    decode_only_routing: true,
+                    ..
+                }
+            ),
         })
     }
 
@@ -213,6 +221,7 @@ impl PDRouter {
     const BOOTSTRAP_HOST_KEY: &'static str = "bootstrap_host";
     const BOOTSTRAP_PORT_KEY: &'static str = "bootstrap_port";
     const BOOTSTRAP_ROOM_KEY: &'static str = "bootstrap_room";
+    const REQUEST_ID_HEADER: &'static str = "x-request-id";
 
     fn inject_bootstrap_into_value(
         mut original: Value,
@@ -274,6 +283,41 @@ impl PDRouter {
         Ok(original)
     }
 
+    fn inject_bootstrap_host_only_into_value(
+        mut original: Value,
+        prefill_worker: &dyn Worker,
+        batch_size: Option<usize>,
+    ) -> Result<Value, String> {
+        let obj = original
+            .as_object_mut()
+            .ok_or_else(|| "Request must be a JSON object".to_string())?;
+
+        if let Some(n) = batch_size {
+            let mut hosts = Vec::with_capacity(n);
+            for _ in 0..n {
+                hosts.push(prefill_worker.bootstrap_host());
+            }
+            obj.insert(
+                Self::BOOTSTRAP_HOST_KEY.to_string(),
+                Value::Array(hosts.into_iter().map(Value::from).collect()),
+            );
+        } else {
+            obj.insert(
+                Self::BOOTSTRAP_HOST_KEY.to_string(),
+                Value::from(prefill_worker.bootstrap_host()),
+            );
+        }
+
+        Ok(original)
+    }
+
+    fn request_id_for_logs(headers: Option<&HeaderMap>) -> &str {
+        headers
+            .and_then(|h| h.get(Self::REQUEST_ID_HEADER))
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown")
+    }
+
     async fn execute_dual_dispatch<T: Serialize + Clone>(
         &self,
         headers: Option<&HeaderMap>,
@@ -320,6 +364,18 @@ impl PDRouter {
                             }
                         };
 
+                        info!(
+                            request_id = Self::request_id_for_logs(headers),
+                            route = context.route,
+                            attempt,
+                            prefill_url = %prefill.url(),
+                            decode_url = %decode.url(),
+                            decode_only_routing = self.decode_only_routing,
+                            is_stream = context.is_stream,
+                            batch_size = context.batch_size.unwrap_or(1),
+                            "selected pd workers"
+                        );
+
                         debug!(
                             "PD retry attempt {} using prefill={} decode={}",
                             attempt,
@@ -332,17 +388,25 @@ impl PDRouter {
                             Err(e) => return Self::handle_serialization_error(e),
                         };
 
-                        json_request = match Self::inject_bootstrap_into_value(
-                            json_request,
-                            prefill.as_ref(),
-                            context.batch_size,
-                        ) {
+                        json_request = match if self.decode_only_routing {
+                            Self::inject_bootstrap_host_only_into_value(
+                                json_request,
+                                prefill.as_ref(),
+                                context.batch_size,
+                            )
+                        } else {
+                            Self::inject_bootstrap_into_value(
+                                json_request,
+                                prefill.as_ref(),
+                                context.batch_size,
+                            )
+                        } {
                             Ok(v) => v,
                             Err(e) => return Self::handle_serialization_error(e),
                         };
 
-                        let response = self
-                            .execute_dual_dispatch_internal(
+                        let response = if self.decode_only_routing {
+                            self.execute_decode_only_dispatch_internal(
                                 headers,
                                 json_request,
                                 context,
@@ -350,7 +414,18 @@ impl PDRouter {
                                 Arc::clone(&decode),
                                 start_time,
                             )
-                            .await;
+                            .await
+                        } else {
+                            self.execute_dual_dispatch_internal(
+                                headers,
+                                json_request,
+                                context,
+                                Arc::clone(&prefill),
+                                Arc::clone(&decode),
+                                start_time,
+                            )
+                            .await
+                        };
 
                         let status = response.status();
                         let not_error = status.is_success() || status.is_client_error();
@@ -568,6 +643,16 @@ impl PDRouter {
             false,
         );
 
+        info!(
+            request_id = Self::request_id_for_logs(headers),
+            route = context.route,
+            prefill_url = %prefill.url(),
+            decode_url = %decode.url(),
+            is_stream = context.is_stream,
+            return_logprob = context.return_logprob,
+            "dispatching pd request to prefill and decode workers"
+        );
+
         // Send both requests concurrently and wait for both
         // Note: Using borrowed references avoids heap allocation
         events::RequestPDSentEvent {
@@ -687,6 +772,115 @@ impl PDRouter {
                     decode_url = %decode.url(),
                     error = %e,
                     "Decode request failed"
+                );
+                error::bad_gateway("decode_server_error", format!("Decode server error: {}", e))
+            }
+        }
+    }
+
+    // Internal method for decode-only dispatch with bootstrap_host injection.
+    async fn execute_decode_only_dispatch_internal(
+        &self,
+        headers: Option<&HeaderMap>,
+        json_request: Value,
+        context: PDRequestContext<'_>,
+        prefill: Arc<dyn Worker>,
+        decode: Arc<dyn Worker>,
+        _start_time: Instant,
+    ) -> Response {
+        let _prefill_guard =
+            (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone(), headers));
+        let _decode_guard =
+            (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone(), headers));
+
+        let mut headers_with_trace = headers.cloned().unwrap_or_default();
+        inject_trace_context_http(&mut headers_with_trace);
+        let headers = Some(&headers_with_trace);
+
+        let decode_request = self.build_post_with_headers(
+            &self.client,
+            decode.url(),
+            context.route,
+            &json_request,
+            headers,
+            false,
+        );
+
+        info!(
+            request_id = Self::request_id_for_logs(headers),
+            route = context.route,
+            prefill_url = %prefill.url(),
+            decode_url = %decode.url(),
+            is_stream = context.is_stream,
+            bootstrap_host = %prefill.bootstrap_host(),
+            "dispatching pd decode-only request"
+        );
+
+        events::RequestPDSentEvent {
+            prefill_url: prefill.url(),
+            decode_url: decode.url(),
+        }
+        .emit();
+
+        let decode_result = decode_request.send().await;
+
+        events::RequestReceivedEvent {}.emit();
+
+        match decode_result {
+            Ok(res) => {
+                let status = StatusCode::from_u16(res.status().as_u16())
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                debug!("Decode-only response status: {}", status);
+
+                if !status.is_success() {
+                    error!(
+                        "Decode server returned error status in decode-only mode decode_url={} status={}",
+                        decode.url(),
+                        status
+                    );
+
+                    return self
+                        .handle_decode_error_response(res, &context, prefill, decode)
+                        .await;
+                }
+
+                if context.is_stream {
+                    let response_headers = header_utils::preserve_response_headers(res.headers());
+                    self.create_streaming_response(
+                        res.bytes_stream(),
+                        status,
+                        None,
+                        false,
+                        None,
+                        Some(response_headers),
+                        prefill,
+                        decode,
+                    )
+                } else {
+                    let response_headers = header_utils::preserve_response_headers(res.headers());
+
+                    match res.bytes().await {
+                        Ok(decode_body) => {
+                            let mut response = Response::new(Body::from(decode_body));
+                            *response.status_mut() = status;
+                            *response.headers_mut() = response_headers;
+                            response
+                        }
+                        Err(e) => {
+                            error!("Failed to read decode-only response: {}", e);
+                            error::internal_error(
+                                "read_response_failed",
+                                "Failed to read response",
+                            )
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                error!(
+                    decode_url = %decode.url(),
+                    error = %e,
+                    "Decode request failed in decode-only mode"
                 );
                 error::bad_gateway("decode_server_error", format!("Decode server error: {}", e))
             }
@@ -1427,6 +1621,7 @@ mod tests {
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
             enable_igw: false,
+            decode_only_routing: false,
         }
     }
 
@@ -1508,6 +1703,32 @@ mod tests {
 
         assert_eq!(prefill_worker.load(), 0);
         assert_eq!(decode_worker.load(), 0);
+    }
+
+    #[test]
+    fn test_inject_bootstrap_host_only_into_value() {
+        let prefill_worker: Arc<dyn Worker> = Arc::from(create_test_worker(
+            "http://prefill".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: Some(9000),
+            },
+            true,
+        ));
+
+        let request = serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+
+        let updated = PDRouter::inject_bootstrap_host_only_into_value(
+            request,
+            prefill_worker.as_ref(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(updated["bootstrap_host"], prefill_worker.bootstrap_host());
+        assert!(updated.get("bootstrap_port").is_none());
+        assert!(updated.get("bootstrap_room").is_none());
     }
 
     #[tokio::test]

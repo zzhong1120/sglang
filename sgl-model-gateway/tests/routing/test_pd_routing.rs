@@ -139,6 +139,7 @@ mod pd_routing_unit_tests {
                     ],
                     prefill_policy: None,
                     decode_policy: None,
+                    decode_only_routing: false,
                 },
                 PolicyConfig::Random,
             ),
@@ -148,6 +149,7 @@ mod pd_routing_unit_tests {
                     decode_urls: vec!["http://decode:8080".to_string()],
                     prefill_policy: None,
                     decode_policy: None,
+                    decode_only_routing: false,
                 },
                 PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 5,
@@ -163,6 +165,7 @@ mod pd_routing_unit_tests {
                     decode_urls: vec!["http://d1:8080".to_string(), "http://d2:8080".to_string()],
                     prefill_policy: None,
                     decode_policy: None,
+                    decode_only_routing: false,
                 },
                 PolicyConfig::CacheAware {
                     cache_threshold: 0.7,
@@ -182,6 +185,7 @@ mod pd_routing_unit_tests {
                     decode_urls: vec!["http://d1:8080".to_string(), "http://d2:8080".to_string()],
                     prefill_policy: None,
                     decode_policy: None,
+                    decode_only_routing: false,
                 },
                 PolicyConfig::Bucket {
                     balance_abs_threshold: 20,

@@ -202,6 +202,10 @@ struct CliArgs {
     #[arg(long, action = ArgAction::Append, help_heading = "PD Disaggregation")]
     decode: Vec<String>,
 
+    /// In PD mode, send requests only to decode workers and inject bootstrap_host from the selected prefill worker
+    #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
+    pd_decode_only_routing: bool,
+
     /// Specific policy for prefill nodes in PD mode
     #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "PD Disaggregation")]
     prefill_policy: Option<String>,
@@ -878,6 +882,7 @@ impl CliArgs {
             RoutingMode::PrefillDecode {
                 prefill_urls,
                 decode_urls: self.decode.clone(),
+                decode_only_routing: self.pd_decode_only_routing,
                 prefill_policy: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
                 decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
             }

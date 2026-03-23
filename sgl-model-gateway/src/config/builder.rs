@@ -58,6 +58,7 @@ impl RouterConfigBuilder {
         self.config.mode = RoutingMode::PrefillDecode {
             prefill_urls,
             decode_urls,
+            decode_only_routing: false,
             prefill_policy: None,
             decode_policy: None,
         };
@@ -75,6 +76,7 @@ impl RouterConfigBuilder {
         self.config.mode = RoutingMode::PrefillDecode {
             prefill_urls,
             decode_urls,
+            decode_only_routing: false,
             prefill_policy,
             decode_policy,
         };

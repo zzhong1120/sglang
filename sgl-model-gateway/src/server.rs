@@ -7,7 +7,8 @@ use std::{
 };
 
 use axum::{
-    extract::{Path, Query, Request, State},
+    extract::{Extension, Path, Query, Request, State},
+    http::{HeaderMap, HeaderValue},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -33,7 +34,7 @@ use crate::{
         worker_manager::WorkerManager,
         Job,
     },
-    middleware::{self, AuthConfig, QueuedRequest},
+    middleware::{self, AuthConfig, QueuedRequest, RequestId},
     observability::{
         logging::{self, LoggingConfig},
         metrics::{self, PrometheusConfig},
@@ -171,9 +172,11 @@ async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Res
 
 async fn generate(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    mut headers: HeaderMap,
+    request_id: Option<Extension<RequestId>>,
     Json(body): Json<GenerateRequest>,
 ) -> Response {
+    ensure_request_id_header(&mut headers, request_id);
     let model_id = body.model.as_deref();
     state
         .router
@@ -183,9 +186,11 @@ async fn generate(
 
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    mut headers: HeaderMap,
+    request_id: Option<Extension<RequestId>>,
     ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
+    ensure_request_id_header(&mut headers, request_id);
     state
         .router
         .route_chat(Some(&headers), &body, Some(&body.model))
@@ -194,9 +199,11 @@ async fn v1_chat_completions(
 
 async fn v1_completions(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    mut headers: HeaderMap,
+    request_id: Option<Extension<RequestId>>,
     Json(body): Json<CompletionRequest>,
 ) -> Response {
+    ensure_request_id_header(&mut headers, request_id);
     state
         .router
         .route_completion(Some(&headers), &body, Some(&body.model))
@@ -205,9 +212,11 @@ async fn v1_completions(
 
 async fn rerank(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    mut headers: HeaderMap,
+    request_id: Option<Extension<RequestId>>,
     ValidatedJson(body): ValidatedJson<RerankRequest>,
 ) -> Response {
+    ensure_request_id_header(&mut headers, request_id);
     state
         .router
         .route_rerank(Some(&headers), &body, Some(&body.model))
@@ -216,14 +225,30 @@ async fn rerank(
 
 async fn v1_rerank(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
+    mut headers: HeaderMap,
+    request_id: Option<Extension<RequestId>>,
     Json(body): Json<V1RerankReqInput>,
 ) -> Response {
+    ensure_request_id_header(&mut headers, request_id);
     let rerank_body = &body.into();
     state
         .router
         .route_rerank(Some(&headers), rerank_body, Some(&rerank_body.model))
         .await
+}
+
+fn ensure_request_id_header(headers: &mut HeaderMap, request_id: Option<Extension<RequestId>>) {
+    const REQUEST_ID_HEADER: &str = "x-request-id";
+
+    if headers.contains_key(REQUEST_ID_HEADER) {
+        return;
+    }
+
+    if let Some(Extension(request_id)) = request_id {
+        if let Ok(value) = HeaderValue::from_str(&request_id.0) {
+            headers.insert(REQUEST_ID_HEADER, value);
+        }
+    }
 }
 
 async fn v1_responses(

@@ -20,6 +20,7 @@ class RouterArgs:
     mini_lb: bool = False
     test_external_dp_routing: bool = False
     pd_disaggregation: bool = False  # Enable PD disaggregated mode
+    pd_decode_only_routing: bool = False
     prefill_urls: List[tuple] = dataclasses.field(
         default_factory=list
     )  # List of (url, bootstrap_port)
@@ -371,6 +372,11 @@ class RouterArgs:
             f"--{prefix}pd-disaggregation",
             action="store_true",
             help="Enable PD (Prefill-Decode) disaggregated mode",
+        )
+        pd_group.add_argument(
+            f"--{prefix}pd-decode-only-routing",
+            action="store_true",
+            help="In PD mode, select a prefill worker for bootstrap_host injection but send the request only to the decode worker",
         )
         pd_group.add_argument(
             f"--{prefix}prefill",

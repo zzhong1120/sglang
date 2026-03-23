@@ -157,6 +157,8 @@ pub enum RoutingMode {
         /// With optional bootstrap ports
         prefill_urls: Vec<(String, Option<u16>)>,
         decode_urls: Vec<String>,
+        #[serde(default)]
+        decode_only_routing: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         prefill_policy: Option<PolicyConfig>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -674,6 +676,7 @@ mod tests {
             decode_urls: vec!["http://decode1".to_string()],
             prefill_policy: None,
             decode_policy: None,
+            decode_only_routing: false,
         };
         assert!(pd.is_pd_mode());
     }
@@ -701,6 +704,7 @@ mod tests {
             ],
             prefill_policy: None,
             decode_policy: None,
+            decode_only_routing: false,
         };
         assert_eq!(pd.worker_count(), 5);
 
@@ -724,6 +728,7 @@ mod tests {
             decode_urls: vec!["http://decode1".to_string()],
             prefill_policy: None,
             decode_policy: None,
+            decode_only_routing: false,
         };
         let json = serde_json::to_string(&pd).unwrap();
         assert!(json.contains("\"type\":\"prefill_decode\""));
@@ -1191,6 +1196,7 @@ mod tests {
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
             }),
+            decode_only_routing: false,
         };
 
         let main_policy = PolicyConfig::Random;
@@ -1219,6 +1225,7 @@ mod tests {
                 max_tree_size: 1000,
             }),
             decode_policy: None,
+            decode_only_routing: false,
         };
 
         let main_policy = PolicyConfig::RoundRobin;
@@ -1243,6 +1250,7 @@ mod tests {
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
             }),
+            decode_only_routing: false,
         };
 
         let main_policy = PolicyConfig::Random;
@@ -1265,6 +1273,7 @@ mod tests {
             decode_urls: vec!["http://decode1".to_string()],
             prefill_policy: None,
             decode_policy: None,
+            decode_only_routing: false,
         };
 
         let main_policy = PolicyConfig::CacheAware {
