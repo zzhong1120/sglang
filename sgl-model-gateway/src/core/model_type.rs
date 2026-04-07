@@ -291,15 +291,22 @@ impl Endpoint {
     pub fn from_path(path: &str) -> Option<Self> {
         // Normalize: strip trailing slash and match
         let path = path.trim_end_matches('/');
-        match path {
-            "/v1/chat/completions" => Some(Endpoint::Chat),
-            "/v1/completions" => Some(Endpoint::Completions),
-            "/v1/responses" => Some(Endpoint::Responses),
-            "/v1/embeddings" => Some(Endpoint::Embeddings),
-            "/v1/rerank" => Some(Endpoint::Rerank),
-            "/generate" => Some(Endpoint::Generate),
-            "/v1/models" => Some(Endpoint::Models),
-            _ => None,
+        if path == "/v1/chat/completions" || path.ends_with("/chat/completions") {
+            Some(Endpoint::Chat)
+        } else if path == "/v1/completions" || path.ends_with("/completions") {
+            Some(Endpoint::Completions)
+        } else if path == "/v1/responses" {
+            Some(Endpoint::Responses)
+        } else if path == "/v1/embeddings" {
+            Some(Endpoint::Embeddings)
+        } else if path == "/v1/rerank" {
+            Some(Endpoint::Rerank)
+        } else if path == "/generate" {
+            Some(Endpoint::Generate)
+        } else if path == "/v1/models" {
+            Some(Endpoint::Models)
+        } else {
+            None
         }
     }
 

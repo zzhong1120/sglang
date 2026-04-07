@@ -57,7 +57,7 @@ pub struct PDRouter {
 
 #[derive(Clone)]
 struct PDRequestContext<'a> {
-    route: &'static str,
+    route: &'a str,
     batch_size: Option<usize>,
     is_stream: bool,
     return_logprob: bool,
@@ -1237,7 +1237,7 @@ impl PDRouter {
         &self,
         client: &Client,
         url: &str,
-        route: &'static str,
+        route: &str,
         json_request: &Value,
         headers: Option<&HeaderMap>,
         connection_close: bool,
@@ -1511,6 +1511,48 @@ impl RouterTrait for PDRouter {
         self.execute_dual_dispatch(headers, body, context).await
     }
 
+    async fn route_chat_path(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
+        route: &str,
+    ) -> Response {
+        let is_stream = body.stream;
+        let return_logprob = body.logprobs;
+
+        let request_text = if self.policies_need_request_text() {
+            body.messages.first().and_then(|msg| match msg {
+                ChatMessage::User { content, .. } => match content {
+                    MessageContent::Text(text) => Some(text.clone()),
+                    MessageContent::Parts(_) => None,
+                },
+                ChatMessage::Developer { content, .. } => match content {
+                    MessageContent::Text(text) => Some(text.clone()),
+                    MessageContent::Parts(_) => None,
+                },
+                ChatMessage::System { content, .. } => Some(content.to_simple_string()),
+                _ => None,
+            })
+        } else {
+            None
+        };
+
+        let batch_size = Self::get_chat_batch_size(body);
+
+        let context = PDRequestContext {
+            route,
+            batch_size,
+            is_stream,
+            return_logprob,
+            request_text,
+            model_id,
+            headers: headers.cloned(),
+        };
+
+        self.execute_dual_dispatch(headers, body, context).await
+    }
+
     async fn route_completion(
         &self,
         headers: Option<&HeaderMap>,
@@ -1534,6 +1576,40 @@ impl RouterTrait for PDRouter {
 
         let context = PDRequestContext {
             route: "/v1/completions",
+            batch_size,
+            is_stream,
+            return_logprob,
+            request_text,
+            model_id,
+            headers: headers.cloned(),
+        };
+
+        self.execute_dual_dispatch(headers, body, context).await
+    }
+
+    async fn route_completion_path(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &CompletionRequest,
+        model_id: Option<&str>,
+        route: &str,
+    ) -> Response {
+        let is_stream = body.stream;
+        let return_logprob = body.logprobs.is_some();
+
+        let request_text = if self.policies_need_request_text() {
+            match &body.prompt {
+                StringOrArray::String(s) => Some(s.clone()),
+                StringOrArray::Array(v) => v.first().map(|s| s.to_string()),
+            }
+        } else {
+            None
+        };
+
+        let batch_size = Self::get_completion_batch_size(body);
+
+        let context = PDRequestContext {
+            route,
             batch_size,
             is_stream,
             return_logprob,

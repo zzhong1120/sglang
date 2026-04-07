@@ -194,7 +194,7 @@ impl Router {
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
-        route: &'static str,
+        route: &str,
         model_id: Option<&str>,
     ) -> Response {
         let start = Instant::now();
@@ -273,7 +273,7 @@ impl Router {
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
-        route: &'static str,
+        route: &str,
         model_id: Option<&str>,
         is_stream: bool,
         text: &str,
@@ -486,7 +486,7 @@ impl Router {
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
-        route: &'static str,
+        route: &str,
         worker_url: &str,
         is_stream: bool,
         load_guard: Option<WorkerLoadGuard>,
@@ -755,6 +755,16 @@ impl RouterTrait for Router {
             .await
     }
 
+    async fn route_chat_path(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
+        route: &str,
+    ) -> Response {
+        self.route_typed_request(headers, body, route, model_id).await
+    }
+
     async fn route_completion(
         &self,
         headers: Option<&HeaderMap>,
@@ -763,6 +773,16 @@ impl RouterTrait for Router {
     ) -> Response {
         self.route_typed_request(headers, body, "/v1/completions", model_id)
             .await
+    }
+
+    async fn route_completion_path(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &CompletionRequest,
+        model_id: Option<&str>,
+        route: &str,
+    ) -> Response {
+        self.route_typed_request(headers, body, route, model_id).await
     }
 
     async fn route_responses(

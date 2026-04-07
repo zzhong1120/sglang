@@ -78,6 +78,9 @@ pub struct AppState {
     pub mesh_sync_manager: Option<Arc<MeshSyncManager>>,
 }
 
+const ROMA_ENGINE_CHAT_COMPLETIONS_PATH: &str = "/v1/engines/roma/chat/completions";
+const ROMA_ENGINE_COMPLETIONS_PATH: &str = "/v1/engines/roma/completions";
+
 async fn parse_function_call(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ParseFunctionCallRequest>,
@@ -197,6 +200,24 @@ async fn v1_chat_completions(
         .await
 }
 
+async fn v1_engine_chat_completions(
+    State(state): State<Arc<AppState>>,
+    mut headers: HeaderMap,
+    request_id: Option<Extension<RequestId>>,
+    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
+) -> Response {
+    ensure_request_id_header(&mut headers, request_id);
+    state
+        .router
+        .route_chat_path(
+            Some(&headers),
+            &body,
+            Some(&body.model),
+            ROMA_ENGINE_CHAT_COMPLETIONS_PATH,
+        )
+        .await
+}
+
 async fn v1_completions(
     State(state): State<Arc<AppState>>,
     mut headers: HeaderMap,
@@ -207,6 +228,24 @@ async fn v1_completions(
     state
         .router
         .route_completion(Some(&headers), &body, Some(&body.model))
+        .await
+}
+
+async fn v1_engine_completions(
+    State(state): State<Arc<AppState>>,
+    mut headers: HeaderMap,
+    request_id: Option<Extension<RequestId>>,
+    Json(body): Json<CompletionRequest>,
+) -> Response {
+    ensure_request_id_header(&mut headers, request_id);
+    state
+        .router
+        .route_completion_path(
+            Some(&headers),
+            &body,
+            Some(&body.model),
+            ROMA_ENGINE_COMPLETIONS_PATH,
+        )
         .await
 }
 
@@ -581,6 +620,14 @@ pub fn build_app(
         .route("/generate", post(generate))
         .route("/v1/chat/completions", post(v1_chat_completions))
         .route("/v1/completions", post(v1_completions))
+        .route(
+            ROMA_ENGINE_CHAT_COMPLETIONS_PATH,
+            post(v1_engine_chat_completions),
+        )
+        .route(
+            ROMA_ENGINE_COMPLETIONS_PATH,
+            post(v1_engine_completions),
+        )
         .route("/rerank", post(rerank))
         .route("/v1/rerank", post(v1_rerank))
         .route("/v1/responses", post(v1_responses))

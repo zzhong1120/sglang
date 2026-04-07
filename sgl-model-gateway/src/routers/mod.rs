@@ -97,6 +97,17 @@ pub trait RouterTrait: Send + Sync + Debug {
         model_id: Option<&str>,
     ) -> Response;
 
+    /// Route a chat completion request using the provided upstream path.
+    async fn route_chat_path(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
+        _route: &str,
+    ) -> Response {
+        self.route_chat(headers, body, model_id).await
+    }
+
     /// Route a completion request
     async fn route_completion(
         &self,
@@ -109,6 +120,17 @@ pub trait RouterTrait: Send + Sync + Debug {
             "Completion endpoint not implemented",
         )
             .into_response()
+    }
+
+    /// Route a completion request using the provided upstream path.
+    async fn route_completion_path(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &CompletionRequest,
+        model_id: Option<&str>,
+        _route: &str,
+    ) -> Response {
+        self.route_completion(headers, body, model_id).await
     }
 
     /// Route a responses request

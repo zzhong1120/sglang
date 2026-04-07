@@ -1020,13 +1020,18 @@ pub(crate) fn parse_finish_reason(
 
 /// Map route path to endpoint label for metrics
 pub(crate) fn route_to_endpoint(route: &str) -> &'static str {
-    match route {
-        "/v1/chat/completions" => metrics_labels::ENDPOINT_CHAT,
-        "/generate" => metrics_labels::ENDPOINT_GENERATE,
-        "/v1/completions" => metrics_labels::ENDPOINT_COMPLETIONS,
-        "/v1/rerank" => metrics_labels::ENDPOINT_RERANK,
-        "/v1/responses" => metrics_labels::ENDPOINT_RESPONSES,
-        _ => "other",
+    if route == "/v1/chat/completions" || route.ends_with("/chat/completions") {
+        metrics_labels::ENDPOINT_CHAT
+    } else if route == "/generate" {
+        metrics_labels::ENDPOINT_GENERATE
+    } else if route == "/v1/completions" || route.ends_with("/completions") {
+        metrics_labels::ENDPOINT_COMPLETIONS
+    } else if route == "/v1/rerank" {
+        metrics_labels::ENDPOINT_RERANK
+    } else if route == "/v1/responses" {
+        metrics_labels::ENDPOINT_RESPONSES
+    } else {
+        "other"
     }
 }
 
