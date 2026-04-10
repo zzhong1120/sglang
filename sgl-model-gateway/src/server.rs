@@ -8,8 +8,8 @@ use std::{
 
 use axum::{
     extract::{Extension, Path, Query, Request, State},
-    http::{HeaderMap, HeaderValue},
     http::StatusCode,
+    http::{HeaderMap, HeaderValue},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
@@ -624,10 +624,7 @@ pub fn build_app(
             ROMA_ENGINE_CHAT_COMPLETIONS_PATH,
             post(v1_engine_chat_completions),
         )
-        .route(
-            ROMA_ENGINE_COMPLETIONS_PATH,
-            post(v1_engine_completions),
-        )
+        .route(ROMA_ENGINE_COMPLETIONS_PATH, post(v1_engine_completions))
         .route("/rerank", post(rerank))
         .route("/v1/rerank", post(v1_rerank))
         .route("/v1/responses", post(v1_responses))

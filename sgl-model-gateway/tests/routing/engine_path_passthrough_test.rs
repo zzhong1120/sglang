@@ -114,8 +114,12 @@ async fn build_pd_app(prefill_url: &str, decode_url: &str) -> axum::Router {
         .worker_type(WorkerType::Decode)
         .build();
 
-    app_context.worker_registry.register(Arc::from(prefill_worker));
-    app_context.worker_registry.register(Arc::from(decode_worker));
+    app_context
+        .worker_registry
+        .register(Arc::from(prefill_worker));
+    app_context
+        .worker_registry
+        .register(Arc::from(decode_worker));
 
     let router = Arc::from(RouterFactory::create_router(&app_context).await.unwrap());
     test_app::create_test_app_with_context(router, app_context)

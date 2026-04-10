@@ -762,7 +762,8 @@ impl RouterTrait for Router {
         model_id: Option<&str>,
         route: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, route, model_id).await
+        self.route_typed_request(headers, body, route, model_id)
+            .await
     }
 
     async fn route_completion(
@@ -782,7 +783,8 @@ impl RouterTrait for Router {
         model_id: Option<&str>,
         route: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, route, model_id).await
+        self.route_typed_request(headers, body, route, model_id)
+            .await
     }
 
     async fn route_responses(

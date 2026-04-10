@@ -67,6 +67,30 @@ struct PDRequestContext<'a> {
 }
 
 impl PDRouter {
+    fn is_worker_outcome_success(result: &Result<reqwest::Response, reqwest::Error>) -> bool {
+        match result {
+            Ok(response) => {
+                let status = response.status();
+                status.is_success() || status.is_client_error()
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn record_dual_dispatch_outcomes(
+        prefill: &Arc<dyn Worker>,
+        prefill_success: bool,
+        decode: &Arc<dyn Worker>,
+        decode_success: bool,
+    ) {
+        prefill.record_outcome(prefill_success);
+        decode.record_outcome(decode_success);
+    }
+
+    fn record_decode_only_outcome(decode: &Arc<dyn Worker>, decode_success: bool) {
+        decode.record_outcome(decode_success);
+    }
+
     async fn proxy_to_first_prefill_worker(
         &self,
         endpoint: &str,
@@ -428,9 +452,6 @@ impl PDRouter {
                         };
 
                         let status = response.status();
-                        let not_error = status.is_success() || status.is_client_error();
-                        prefill.record_outcome(not_error);
-                        decode.record_outcome(not_error);
 
                         // Record worker errors for server errors (5xx)
                         if status.is_server_error() {
@@ -558,49 +579,49 @@ impl PDRouter {
 
                     let status_code = StatusCode::from_u16(status.as_u16())
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    match status_code {
-                        StatusCode::BAD_REQUEST => {
-                            error::bad_request("decode_bad_request", error_message)
-                        }
-                        StatusCode::NOT_FOUND => {
-                            error::not_found("decode_not_found", error_message)
-                        }
-                        StatusCode::INTERNAL_SERVER_ERROR => {
-                            error::internal_error("decode_internal_error", error_message)
-                        }
-                        StatusCode::SERVICE_UNAVAILABLE => {
-                            error::service_unavailable("decode_unavailable", error_message)
-                        }
-                        StatusCode::BAD_GATEWAY => {
-                            error::bad_gateway("decode_bad_gateway", error_message)
-                        }
-                        _ => error::internal_error("decode_error", error_message),
-                    }
+                    let error_code = match status_code {
+                        StatusCode::BAD_REQUEST => "decode_bad_request",
+                        StatusCode::NOT_FOUND => "decode_not_found",
+                        StatusCode::TOO_MANY_REQUESTS => "decode_too_many_requests",
+                        StatusCode::INTERNAL_SERVER_ERROR => "decode_internal_error",
+                        StatusCode::SERVICE_UNAVAILABLE => "decode_unavailable",
+                        StatusCode::BAD_GATEWAY => "decode_bad_gateway",
+                        _ => "decode_error",
+                    };
+
+                    Self::create_decode_error_response(status_code, error_code, error_message)
                 }
                 Err(e) => {
                     let error_message = format!("Decode server error: {}", e);
                     let status_code = StatusCode::from_u16(status.as_u16())
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    match status_code {
-                        StatusCode::BAD_REQUEST => {
-                            error::bad_request("decode_read_failed", error_message)
-                        }
-                        StatusCode::NOT_FOUND => {
-                            error::not_found("decode_read_failed", error_message)
-                        }
-                        StatusCode::INTERNAL_SERVER_ERROR => {
-                            error::internal_error("decode_read_failed", error_message)
-                        }
-                        StatusCode::SERVICE_UNAVAILABLE => {
-                            error::service_unavailable("decode_read_failed", error_message)
-                        }
-                        StatusCode::BAD_GATEWAY => {
-                            error::bad_gateway("decode_read_failed", error_message)
-                        }
-                        _ => error::internal_error("decode_read_failed", error_message),
-                    }
+                    Self::create_decode_error_response(
+                        status_code,
+                        "decode_read_failed",
+                        error_message,
+                    )
                 }
             }
+        }
+    }
+
+    fn create_decode_error_response(
+        status_code: StatusCode,
+        error_code: &str,
+        error_message: String,
+    ) -> Response {
+        match status_code {
+            StatusCode::BAD_REQUEST => error::bad_request(error_code, error_message),
+            StatusCode::NOT_FOUND => error::not_found(error_code, error_message),
+            StatusCode::INTERNAL_SERVER_ERROR => error::internal_error(error_code, error_message),
+            StatusCode::SERVICE_UNAVAILABLE => {
+                error::service_unavailable(error_code, error_message)
+            }
+            StatusCode::BAD_GATEWAY => error::bad_gateway(error_code, error_message),
+            _ if status_code.is_client_error() || status_code.is_server_error() => {
+                error::create_error(status_code, error_code, error_message)
+            }
+            _ => error::internal_error(error_code, error_message),
         }
     }
 
@@ -663,6 +684,13 @@ impl PDRouter {
 
         let (prefill_result, decode_result) =
             tokio::join!(prefill_request.send(), decode_request.send());
+
+        Self::record_dual_dispatch_outcomes(
+            &prefill,
+            Self::is_worker_outcome_success(&prefill_result),
+            &decode,
+            Self::is_worker_outcome_success(&decode_result),
+        );
 
         events::RequestReceivedEvent {}.emit();
 
@@ -824,6 +852,9 @@ impl PDRouter {
 
         let decode_result = decode_request.send().await;
 
+        // Decode-only routing does not actually send a request to the selected prefill worker.
+        Self::record_decode_only_outcome(&decode, Self::is_worker_outcome_success(&decode_result));
+
         events::RequestReceivedEvent {}.emit();
 
         match decode_result {
@@ -868,10 +899,7 @@ impl PDRouter {
                         }
                         Err(e) => {
                             error!("Failed to read decode-only response: {}", e);
-                            error::internal_error(
-                                "read_response_failed",
-                                "Failed to read response",
-                            )
+                            error::internal_error("read_response_failed", "Failed to read response")
                         }
                     }
                 }
@@ -996,6 +1024,29 @@ impl PDRouter {
             .collect();
 
         if available_workers.is_empty() {
+            let worker_diagnostics = workers
+                .iter()
+                .map(|w| {
+                    let cb = w.circuit_breaker().stats();
+                    format!(
+                        "{} healthy={} cb_state={} cb_failures={} cb_successes={}",
+                        w.url(),
+                        w.is_healthy(),
+                        cb.state,
+                        cb.consecutive_failures,
+                        cb.consecutive_successes
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            warn!(
+                worker_type,
+                candidate_count = workers.len(),
+                candidates = %worker_diagnostics,
+                "No available workers after health/circuit filtering"
+            );
+
             return Err(format!(
                 "No available {} workers (all circuits open or unhealthy)",
                 worker_type
@@ -1684,6 +1735,7 @@ impl RouterTrait for PDRouter {
 mod tests {
     use super::*;
     use crate::core::{BasicWorkerBuilder, WorkerType};
+    use crate::routers::error::HEADER_X_SMG_ERROR_CODE;
 
     fn create_test_pd_router() -> PDRouter {
         let worker_registry = Arc::new(WorkerRegistry::new());
@@ -1795,16 +1847,77 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         });
 
-        let updated = PDRouter::inject_bootstrap_host_only_into_value(
-            request,
-            prefill_worker.as_ref(),
-            None,
-        )
-        .unwrap();
+        let updated =
+            PDRouter::inject_bootstrap_host_only_into_value(request, prefill_worker.as_ref(), None)
+                .unwrap();
 
         assert_eq!(updated["bootstrap_host"], prefill_worker.bootstrap_host());
         assert!(updated.get("bootstrap_port").is_none());
         assert!(updated.get("bootstrap_room").is_none());
+    }
+
+    #[test]
+    fn test_record_dual_dispatch_outcomes_are_independent() {
+        let prefill_worker: Arc<dyn Worker> = Arc::from(create_test_worker(
+            "http://prefill".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            true,
+        ));
+        let decode_worker: Arc<dyn Worker> = Arc::from(create_test_worker(
+            "http://decode".to_string(),
+            WorkerType::Decode,
+            true,
+        ));
+
+        PDRouter::record_dual_dispatch_outcomes(&prefill_worker, true, &decode_worker, false);
+
+        assert_eq!(prefill_worker.circuit_breaker().consecutive_failures(), 0);
+        assert_eq!(prefill_worker.circuit_breaker().consecutive_successes(), 1);
+        assert_eq!(decode_worker.circuit_breaker().consecutive_failures(), 1);
+        assert_eq!(decode_worker.circuit_breaker().consecutive_successes(), 0);
+    }
+
+    #[test]
+    fn test_decode_only_outcome_does_not_penalize_prefill_worker() {
+        let prefill_worker: Arc<dyn Worker> = Arc::from(create_test_worker(
+            "http://prefill".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            true,
+        ));
+        let decode_worker: Arc<dyn Worker> = Arc::from(create_test_worker(
+            "http://decode".to_string(),
+            WorkerType::Decode,
+            true,
+        ));
+
+        PDRouter::record_decode_only_outcome(&decode_worker, false);
+
+        assert_eq!(prefill_worker.circuit_breaker().consecutive_failures(), 0);
+        assert_eq!(prefill_worker.circuit_breaker().consecutive_successes(), 0);
+        assert_eq!(decode_worker.circuit_breaker().consecutive_failures(), 1);
+        assert_eq!(decode_worker.circuit_breaker().consecutive_successes(), 0);
+    }
+
+    #[test]
+    fn test_non_streaming_decode_error_preserves_429_status() {
+        let response = PDRouter::create_decode_error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "decode_too_many_requests",
+            "rate limited".to_string(),
+        );
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(HEADER_X_SMG_ERROR_CODE)
+                .and_then(|value| value.to_str().ok()),
+            Some("decode_too_many_requests")
+        );
     }
 
     #[tokio::test]
