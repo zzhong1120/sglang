@@ -1,20 +1,55 @@
+use std::sync::Arc;
+
 use axum::{
     body::Body,
     extract::Request,
     http::{header::CONTENT_TYPE, StatusCode},
 };
 use serde_json::json;
-use smg::{config::RouterConfig, routers::RouterFactory};
+use smg::{
+    config::RouterConfig,
+    core::{BasicWorkerBuilder, Worker, WorkerType as CoreWorkerType},
+    routers::{http::router::Router as HttpRouter, RouterFactory, RouterTrait},
+};
 use tower::ServiceExt;
 
 use crate::common::{
     mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType},
-    AppTestContext,
+    test_app, AppTestContext,
 };
 
 #[cfg(test)]
 mod health_tests {
     use super::*;
+
+    async fn create_pd_health_app(worker_types: Vec<CoreWorkerType>) -> axum::Router {
+        let config = RouterConfig::builder()
+            .prefill_decode_mode(vec![], vec![])
+            .random_policy()
+            .host("127.0.0.1")
+            .port(3003)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(1)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .build_unchecked();
+
+        let app_context = crate::common::create_test_context(config).await;
+        for (idx, worker_type) in worker_types.into_iter().enumerate() {
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(format!("http://worker-{idx}"))
+                    .worker_type(worker_type)
+                    .build(),
+            );
+            worker.set_healthy(true);
+            app_context.worker_registry.register(worker);
+        }
+
+        let router: Arc<dyn RouterTrait> = Arc::new(HttpRouter::new(&app_context).await.unwrap());
+        test_app::create_test_app_with_context(router, app_context)
+    }
 
     #[tokio::test]
     async fn test_liveness_endpoint() {
@@ -31,6 +66,43 @@ mod health_tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_pd_health_requires_prefill_and_decode_workers() {
+        let app = create_pd_health_app(vec![CoreWorkerType::Prefill {
+            bootstrap_port: None,
+        }])
+        .await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_pd_health_succeeds_with_prefill_and_decode_workers() {
+        let app = create_pd_health_app(vec![
+            CoreWorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            CoreWorkerType::Decode,
+        ])
+        .await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]

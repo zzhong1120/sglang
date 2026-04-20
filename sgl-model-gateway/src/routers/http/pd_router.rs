@@ -1,4 +1,7 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use async_trait::async_trait;
 use axum::{
@@ -64,6 +67,12 @@ struct PDRequestContext<'a> {
     request_text: Option<String>,
     model_id: Option<&'a str>,
     headers: Option<HeaderMap>,
+}
+
+#[derive(Clone, Debug)]
+struct PDRetryExclusions {
+    prefill_url: String,
+    decode_url: String,
 }
 
 impl PDRouter {
@@ -366,19 +375,30 @@ impl PDRouter {
         // Clone request once outside the retry loop, then use Arc to share across attempts
         // This avoids O(retries) clones by sharing the same data
         let shared_request = Arc::new(original_request.clone());
+        let service_unavailable_exclusions: Arc<Mutex<Option<PDRetryExclusions>>> =
+            Arc::new(Mutex::new(None));
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             {
+                let service_unavailable_exclusions = Arc::clone(&service_unavailable_exclusions);
                 move |attempt: u32| {
                     // Clone Arc (cheap reference count increment) instead of cloning the entire request
                     let shared_request = Arc::clone(&shared_request);
                     let context = context.clone();
+                    let service_unavailable_exclusions =
+                        Arc::clone(&service_unavailable_exclusions);
                     async move {
+                        let exclusions = service_unavailable_exclusions
+                            .lock()
+                            .ok()
+                            .and_then(|guard| guard.clone());
+
                         let (prefill, decode) = match self
-                            .select_pd_pair(
+                            .select_pd_pair_excluding(
                                 context.request_text.as_deref(),
                                 context.model_id,
                                 context.headers.as_ref(),
+                                exclusions.as_ref(),
                             )
                             .await
                         {
@@ -452,6 +472,19 @@ impl PDRouter {
                         };
 
                         let status = response.status();
+
+                        if self.decode_only_routing {
+                            if let Ok(mut guard) = service_unavailable_exclusions.lock() {
+                                *guard = if status == StatusCode::SERVICE_UNAVAILABLE {
+                                    Some(PDRetryExclusions {
+                                        prefill_url: prefill.url().to_string(),
+                                        decode_url: decode.url().to_string(),
+                                    })
+                                } else {
+                                    None
+                                };
+                            }
+                        }
 
                         // Record worker errors for server errors (5xx)
                         if status.is_server_error() {
@@ -927,6 +960,17 @@ impl PDRouter {
         model_id: Option<&str>,
         headers: Option<&HeaderMap>,
     ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
+        self.select_pd_pair_excluding(request_text, model_id, headers, None)
+            .await
+    }
+
+    async fn select_pd_pair_excluding(
+        &self,
+        request_text: Option<&str>,
+        model_id: Option<&str>,
+        headers: Option<&HeaderMap>,
+        exclusions: Option<&PDRetryExclusions>,
+    ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
         debug!(
@@ -971,6 +1015,7 @@ impl PDRouter {
             headers,
             hash_ring.clone(),
             "prefill",
+            exclusions.map(|e| e.prefill_url.as_str()),
         )
         .await?;
 
@@ -981,6 +1026,7 @@ impl PDRouter {
             headers,
             hash_ring,
             "decode",
+            exclusions.map(|e| e.decode_url.as_str()),
         )
         .await?;
 
@@ -1009,6 +1055,7 @@ impl PDRouter {
         headers: Option<&HeaderMap>,
         hash_ring: Option<Arc<HashRing>>,
         worker_type: &str,
+        excluded_url: Option<&str>,
     ) -> Result<Arc<dyn Worker>, String> {
         if workers.is_empty() {
             return Err(format!(
@@ -1053,9 +1100,26 @@ impl PDRouter {
             ));
         }
 
+        let selection_workers: Vec<Arc<dyn Worker>> = match excluded_url {
+            Some(excluded_url) => {
+                let filtered = available_workers
+                    .iter()
+                    .filter(|w| w.url() != excluded_url)
+                    .cloned()
+                    .collect::<Vec<_>>();
+
+                if filtered.is_empty() {
+                    available_workers
+                } else {
+                    filtered
+                }
+            }
+            None => available_workers,
+        };
+
         let selected_idx = policy
             .select_worker(
-                &available_workers,
+                &selection_workers,
                 &SelectWorkerInfo {
                     request_text,
                     tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
@@ -1072,7 +1136,7 @@ impl PDRouter {
                 )
             })?;
 
-        Ok(available_workers[selected_idx].clone())
+        Ok(selection_workers[selected_idx].clone())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1793,6 +1857,77 @@ mod tests {
 
         assert_eq!(prefill.url(), "http://healthy");
         assert!(prefill.is_healthy());
+    }
+
+    #[tokio::test]
+    async fn test_select_pd_pair_excludes_previous_workers_when_alternatives_exist() {
+        let router = create_test_pd_router();
+
+        let prefill_1 = create_test_worker(
+            "http://prefill-1".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            true,
+        );
+        let prefill_2 = create_test_worker(
+            "http://prefill-2".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            true,
+        );
+        let decode_1 = create_test_worker("http://decode-1".to_string(), WorkerType::Decode, true);
+        let decode_2 = create_test_worker("http://decode-2".to_string(), WorkerType::Decode, true);
+
+        router.worker_registry.register(Arc::from(prefill_1));
+        router.worker_registry.register(Arc::from(prefill_2));
+        router.worker_registry.register(Arc::from(decode_1));
+        router.worker_registry.register(Arc::from(decode_2));
+
+        let (first_prefill, first_decode) = router.select_pd_pair(None, None, None).await.unwrap();
+        let exclusions = PDRetryExclusions {
+            prefill_url: first_prefill.url().to_string(),
+            decode_url: first_decode.url().to_string(),
+        };
+
+        let (retry_prefill, retry_decode) = router
+            .select_pd_pair_excluding(None, None, None, Some(&exclusions))
+            .await
+            .unwrap();
+
+        assert_ne!(retry_prefill.url(), first_prefill.url());
+        assert_ne!(retry_decode.url(), first_decode.url());
+    }
+
+    #[tokio::test]
+    async fn test_select_pd_pair_exclusion_falls_back_when_no_alternative_exists() {
+        let router = create_test_pd_router();
+
+        let prefill = create_test_worker(
+            "http://prefill".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            true,
+        );
+        let decode = create_test_worker("http://decode".to_string(), WorkerType::Decode, true);
+
+        router.worker_registry.register(Arc::from(prefill));
+        router.worker_registry.register(Arc::from(decode));
+
+        let exclusions = PDRetryExclusions {
+            prefill_url: "http://prefill".to_string(),
+            decode_url: "http://decode".to_string(),
+        };
+
+        let (retry_prefill, retry_decode) = router
+            .select_pd_pair_excluding(None, None, None, Some(&exclusions))
+            .await
+            .unwrap();
+
+        assert_eq!(retry_prefill.url(), "http://prefill");
+        assert_eq!(retry_decode.url(), "http://decode");
     }
 
     #[tokio::test]

@@ -106,23 +106,20 @@ async fn liveness() -> Response {
 async fn readiness(State(state): State<Arc<AppState>>) -> Response {
     let workers = state.context.worker_registry.get_all();
     let healthy_workers: Vec<_> = workers.iter().filter(|w| w.is_healthy()).collect();
+    let healthy_prefill_workers = healthy_workers
+        .iter()
+        .filter(|w| matches!(w.worker_type(), WorkerType::Prefill { .. }))
+        .count();
+    let healthy_decode_workers = healthy_workers
+        .iter()
+        .filter(|w| matches!(w.worker_type(), WorkerType::Decode))
+        .count();
 
-    let is_ready = if state.context.router_config.enable_igw {
-        !healthy_workers.is_empty()
-    } else {
-        match &state.context.router_config.mode {
-            RoutingMode::PrefillDecode { .. } => {
-                let has_prefill = healthy_workers
-                    .iter()
-                    .any(|w| matches!(w.worker_type(), WorkerType::Prefill { .. }));
-                let has_decode = healthy_workers
-                    .iter()
-                    .any(|w| matches!(w.worker_type(), WorkerType::Decode));
-                has_prefill && has_decode
-            }
-            RoutingMode::Regular { .. } => !healthy_workers.is_empty(),
-            RoutingMode::OpenAI { .. } => !healthy_workers.is_empty(),
+    let is_ready = match &state.context.router_config.mode {
+        RoutingMode::PrefillDecode { .. } => {
+            healthy_prefill_workers > 0 && healthy_decode_workers > 0
         }
+        RoutingMode::Regular { .. } | RoutingMode::OpenAI { .. } => !healthy_workers.is_empty(),
     };
 
     if is_ready {
@@ -131,6 +128,8 @@ async fn readiness(State(state): State<Arc<AppState>>) -> Response {
             Json(json!({
                 "status": "ready",
                 "healthy_workers": healthy_workers.len(),
+                "healthy_prefill_workers": healthy_prefill_workers,
+                "healthy_decode_workers": healthy_decode_workers,
                 "total_workers": workers.len()
             })),
         )
@@ -140,15 +139,19 @@ async fn readiness(State(state): State<Arc<AppState>>) -> Response {
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({
                 "status": "not ready",
-                "reason": "insufficient healthy workers"
+                "reason": "insufficient healthy workers",
+                "healthy_workers": healthy_workers.len(),
+                "healthy_prefill_workers": healthy_prefill_workers,
+                "healthy_decode_workers": healthy_decode_workers,
+                "total_workers": workers.len()
             })),
         )
             .into_response()
     }
 }
 
-async fn health(_state: State<Arc<AppState>>) -> Response {
-    liveness().await
+async fn health(state: State<Arc<AppState>>) -> Response {
+    readiness(state).await
 }
 
 async fn health_generate(State(state): State<Arc<AppState>>, req: Request) -> Response {
