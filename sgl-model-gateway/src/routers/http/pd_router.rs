@@ -1064,6 +1064,32 @@ impl PDRouter {
             ));
         }
 
+        let worker_diagnostics = workers
+            .iter()
+            .map(|w| {
+                let cb = w.circuit_breaker().stats();
+                format!(
+                    "{} healthy={} available={} cb_state={} cb_failures={} cb_successes={} load={}",
+                    w.url(),
+                    w.is_healthy(),
+                    w.is_available(),
+                    cb.state,
+                    cb.consecutive_failures,
+                    cb.consecutive_successes,
+                    w.load()
+                )
+            })
+            .collect::<Vec<_>>();
+
+        debug!(
+            worker_type,
+            policy = policy.name(),
+            excluded_url = excluded_url.unwrap_or("none"),
+            candidates = ?worker_diagnostics,
+            request_text_present = request_text.is_some(),
+            "PD worker candidates before availability/exclusion filtering"
+        );
+
         let available_workers: Vec<Arc<dyn Worker>> = workers
             .iter()
             .filter(|w| w.is_available())
@@ -1116,6 +1142,19 @@ impl PDRouter {
             }
             None => available_workers,
         };
+
+        let available_urls = selection_workers
+            .iter()
+            .map(|w| w.url().to_string())
+            .collect::<Vec<_>>();
+        debug!(
+            worker_type,
+            policy = policy.name(),
+            excluded_url = excluded_url.unwrap_or("none"),
+            selection_count = available_urls.len(),
+            selection_workers = ?available_urls,
+            "PD workers after availability/exclusion filtering"
+        );
 
         let selected_idx = policy
             .select_worker(

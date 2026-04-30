@@ -58,6 +58,11 @@ impl PolicyRegistry {
         *self.mesh_sync.write().unwrap() = mesh_sync;
     }
 
+    /// Get current mesh sync manager snapshot.
+    pub fn mesh_sync(&self) -> OptionalMeshSyncManager {
+        self.mesh_sync.read().unwrap().clone()
+    }
+
     /// Called when a worker is added
     /// Returns the policy that should be used for this worker's model
     pub fn on_worker_added(
@@ -323,6 +328,33 @@ impl PolicyRegistry {
                     debug!(
                         "Removed worker {} from cache-aware policy for model {}",
                         worker_url, model_id
+                    );
+                }
+            }
+        }
+
+        if let Some(prefill_policy) = self.prefill_policy.get() {
+            if prefill_policy.name() == "cache_aware" {
+                if let Some(cache_aware) =
+                    prefill_policy.as_any().downcast_ref::<CacheAwarePolicy>()
+                {
+                    cache_aware.remove_worker_by_url(worker_url);
+                    debug!(
+                        "Removed worker {} from PD prefill cache-aware policy",
+                        worker_url
+                    );
+                }
+            }
+        }
+
+        if let Some(decode_policy) = self.decode_policy.get() {
+            if decode_policy.name() == "cache_aware" {
+                if let Some(cache_aware) = decode_policy.as_any().downcast_ref::<CacheAwarePolicy>()
+                {
+                    cache_aware.remove_worker_by_url(worker_url);
+                    debug!(
+                        "Removed worker {} from PD decode cache-aware policy",
+                        worker_url
                     );
                 }
             }

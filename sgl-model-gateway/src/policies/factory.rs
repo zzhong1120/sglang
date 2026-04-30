@@ -2,6 +2,8 @@
 
 use std::sync::Arc;
 
+use smg_mesh::OptionalMeshSyncManager;
+
 use super::{
     BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy,
     LoadBalancingPolicy, ManualConfig, ManualPolicy, PowerOfTwoPolicy, PrefixHashConfig,
@@ -15,6 +17,14 @@ pub struct PolicyFactory;
 impl PolicyFactory {
     /// Create a policy from configuration
     pub fn create_from_config(config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
+        Self::create_from_config_with_mesh(config, None)
+    }
+
+    /// Create a policy from configuration with optional mesh sync support.
+    pub fn create_from_config_with_mesh(
+        config: &PolicyConfig,
+        mesh_sync: OptionalMeshSyncManager,
+    ) -> Arc<dyn LoadBalancingPolicy> {
         match config {
             PolicyConfig::Random => Arc::new(RandomPolicy::new()),
             PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
@@ -33,7 +43,9 @@ impl PolicyFactory {
                     eviction_interval_secs: *eviction_interval_secs,
                     max_tree_size: *max_tree_size,
                 };
-                Arc::new(CacheAwarePolicy::with_config(config))
+                let mut policy = CacheAwarePolicy::with_config(config);
+                policy.set_mesh_sync(mesh_sync);
+                Arc::new(policy)
             }
             PolicyConfig::Bucket {
                 balance_abs_threshold,
