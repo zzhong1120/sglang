@@ -791,6 +791,63 @@ async fn test_openai_router_chat_streaming_with_mock() {
     assert!(text.contains("[DONE]"));
 }
 
+#[tokio::test]
+async fn test_openai_router_preserves_json_error_content_type_for_streaming_chat() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": {
+                        "message": "stream request rejected",
+                        "type": "invalid_request_error"
+                    }
+                })),
+            )
+        }),
+    );
+
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let base_url = format!("http://{}", addr);
+    let ctx = crate::common::test_app::create_test_app_context().await;
+    crate::common::test_app::register_external_worker(&ctx, &base_url, None);
+    let router = OpenAIRouter::new(&ctx).await.unwrap();
+
+    let chat_request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "gpt-3.5-turbo",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "stream": true
+    }))
+    .unwrap();
+
+    let response = router.route_chat(None, &chat_request, None).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let ct = response
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(ct.contains("application/json"));
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let response_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(response_json["error"]["message"], "stream request rejected");
+
+    server.abort();
+}
+
 /// Test circuit breaker functionality
 #[tokio::test]
 async fn test_openai_router_circuit_breaker() {

@@ -174,6 +174,70 @@ async fn regular_router_passes_through_engine_completion_path() {
 }
 
 #[tokio::test]
+async fn regular_router_preserves_json_error_content_type_for_streaming_chat() {
+    async fn error_handler() -> impl IntoResponse {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {
+                    "message": "stream request rejected",
+                    "type": "invalid_request_error"
+                }
+            })),
+        )
+    }
+
+    let app = Router::new().route("/v1/chat/completions", post(error_handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let handle = tokio::spawn(async move {
+        let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+            let _ = shutdown_rx.await;
+        });
+        server.await.unwrap();
+    });
+
+    let upstream_url = format!("http://{}", addr);
+    let app = build_regular_app(&upstream_url).await;
+
+    let payload = json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "hello"}],
+        "stream": true
+    });
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let ct = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(ct.contains("application/json"));
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body_json["error"]["message"], "stream request rejected");
+
+    let _ = shutdown_tx.send(());
+    let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), handle).await;
+}
+
+#[tokio::test]
 async fn pd_router_passes_through_engine_chat_path() {
     let prefill = UpstreamServer::start("/v1/engines/roma/chat/completions").await;
     let decode = UpstreamServer::start("/v1/engines/roma/chat/completions").await;

@@ -1239,7 +1239,9 @@ impl PDRouter {
         *response.status_mut() = status;
 
         let mut response_headers = headers.unwrap_or_default();
-        response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        if status.is_success() {
+            response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        }
         *response.headers_mut() = response_headers;
 
         AttachedBody::wrap_response(response, guards)

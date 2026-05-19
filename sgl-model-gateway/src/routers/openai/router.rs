@@ -630,6 +630,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                         if status.is_success() {
                             worker.circuit_breaker().record_success();
                         }
+                        let content_type = resp.headers().get(CONTENT_TYPE).cloned();
                         let stream = resp.bytes_stream();
                         let (tx, rx) = mpsc::unbounded_channel();
                         tokio::spawn(async move {
@@ -651,9 +652,14 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                         let mut response =
                             Response::new(Body::from_stream(UnboundedReceiverStream::new(rx)));
                         *response.status_mut() = status;
-                        response
-                            .headers_mut()
-                            .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+                        if status.is_success() {
+                            response.headers_mut().insert(
+                                CONTENT_TYPE,
+                                HeaderValue::from_static("text/event-stream"),
+                            );
+                        } else if let Some(ct) = content_type {
+                            response.headers_mut().insert(CONTENT_TYPE, ct);
+                        }
                         response
                     }
                 }
