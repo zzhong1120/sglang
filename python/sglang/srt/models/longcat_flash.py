@@ -117,7 +117,7 @@ if _is_cuda:
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
-    from sglang.srt.layers.quantization.awq_triton import (
+    from sglang.srt.layers.quantization.awq.awq_triton import (
         awq_dequantize_triton as awq_dequantize,
     )
 else:
@@ -776,18 +776,6 @@ class LongcatFlashForCausalLM(nn.Module):
                         )
                         if _is_hip:
                             self_attn.w_scale *= 2.0
-                    # TODO: remove this after adding FP8 support in bmm cpu kernel
-                    if (
-                        _is_cpu
-                        and _is_cpu_amx_available
-                        and w.dtype == torch.float8_e4m3fn
-                    ):
-                        self_attn.w_kc = (
-                            self_attn.w_kc.to(torch.bfloat16) * self_attn.w_scale
-                        )
-                        self_attn.w_vc = (
-                            self_attn.w_vc.to(torch.bfloat16) * self_attn.w_scale
-                        )
                 else:
                     num_tiles_k = self_attn.qk_nope_head_dim // weight_block_size[1]
                     num_tiles_n = self_attn.v_head_dim // weight_block_size[0]

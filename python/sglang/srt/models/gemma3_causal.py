@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2025 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +14,7 @@
 # limitations under the License.
 # ==============================================================================
 import copy
-from typing import Iterable, Optional, Set, Tuple
+from typing import Iterable, List, Optional, Set, Tuple
 
 import einops
 import torch
@@ -24,7 +26,10 @@ from transformers import (
     PreTrainedModel,
 )
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.layernorm import Gemma3RMSNorm
 from sglang.srt.layers.linear import (
@@ -35,14 +40,17 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
-from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
+from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb, get_rope
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu, make_layers
+
+_is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -92,11 +100,12 @@ class Gemma3MLP(nn.Module):
         )
         if hidden_activation != "gelu_pytorch_tanh":
             raise ValueError(
-                "Gemma3 uses `gelu_pytorch_tanh` as the hidden activation "
+                f"{self.__class__.__name__} uses `gelu_pytorch_tanh` as the hidden activation "
                 "function. Please set `hidden_activation` to "
                 "`gelu_pytorch_tanh`."
             )
         self.act_fn = GeluAndMul()
+        self.prefix = prefix
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
@@ -141,7 +150,8 @@ class Gemma3Attention(nn.Module):
             config, "head_dim", hidden_size // config.num_attention_heads
         )
         self.head_dim = head_dim
-
+        partial_rotary_factor = getattr(config, "partial_rotary_factor", 1)
+        self.rotary_dim = int(partial_rotary_factor * self.head_dim)
         self.q_size = self.num_heads * self.head_dim
 
         self.kv_size = self.num_kv_heads * self.head_dim
@@ -197,7 +207,14 @@ class Gemma3Attention(nn.Module):
                 )
             self.rope_scaling = {"rope_type": "default"}
             self.sliding_window = None
-
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            rotary_dim=self.rotary_dim,
+            max_position=max_position_embeddings,
+            base=self.rope_theta,
+            rope_scaling=self.rope_scaling,
+            is_neox_style=getattr(config, "rope_is_neox_style", True),
+        )
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -217,8 +234,39 @@ class Gemma3Attention(nn.Module):
         self.q_norm = Gemma3RMSNorm(dim=config.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Gemma3RMSNorm(dim=config.head_dim, eps=config.rms_norm_eps)
 
-    def forward(
+    def forward_cpu(
         self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        forward_batch: ForwardBatch,
+        **kwargs,
+    ) -> torch.Tensor:
+        qkv, _ = self.qkv_proj(hidden_states)
+        # [s, h * head_dim]
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        # [s, h, head_dim]
+        q = q.unflatten(-1, (self.num_heads, self.head_dim)).unsqueeze(0)
+        q = self.q_norm(q)
+        k = k.unflatten(-1, (self.num_kv_heads, self.head_dim)).unsqueeze(0)
+        k = self.k_norm(k)
+        q, k = self.rotary_emb(positions, q, k)
+
+        attn_output = self.attn(q, k, v, forward_batch=forward_batch)
+
+        # Compatible with triton backend which returns [1, s, h, head_dim]
+        if attn_output.dim() == 4 and attn_output.shape[0] == 1:
+            attn_output = attn_output.squeeze(0)
+            attn_output = attn_output.flatten(-2, -1)
+        # [s, h * head_dim]
+
+        output, _ = self.o_proj(attn_output)
+        return output
+
+    def forward_native(
+        self,
+        positions: torch.Tensor,
         hidden_states: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         forward_batch: ForwardBatch,
@@ -256,6 +304,22 @@ class Gemma3Attention(nn.Module):
 
         output, _ = self.o_proj(attn_output)
         return output
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        forward_batch: ForwardBatch,
+        **kwargs,
+    ) -> torch.Tensor:
+        if _is_cpu and _is_cpu_amx_available:
+            return self.forward_cpu(
+                positions, hidden_states, position_embeddings, forward_batch, **kwargs
+            )
+        return self.forward_native(
+            positions, hidden_states, position_embeddings, forward_batch, **kwargs
+        )
 
 
 class Gemma3DecoderLayer(nn.Module):
@@ -516,8 +580,9 @@ class Gemma3TextModel(PreTrainedModel):
 
         global_config = copy.deepcopy(config)
         global_config.rope_parameters = {
-            "rope_type": "default",
             "rope_theta": global_theta,
+            "factor": config.rope_parameters["full_attention"]["factor"],
+            "rope_type": "linear",
         }
         self.rotary_emb = Gemma3RotaryEmbedding(config=global_config)
         self.gradient_checkpointing = False
@@ -540,6 +605,7 @@ class Gemma3TextModel(PreTrainedModel):
             prefix=add_prefix("layers", prefix),
         )
         self.norm = Gemma3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.layers_to_capture = []
         self.post_init()
 
     def forward(
@@ -555,25 +621,53 @@ class Gemma3TextModel(PreTrainedModel):
         else:
             hidden_states = input_embeds
 
-        if positions.dim() == 1:
-            positions = einops.rearrange(positions, "s -> 1 s")
+        aux_hidden_states = []
 
-        position_embeddings_global = self.rotary_emb(hidden_states, positions)
-        position_embeddings_local = self.rotary_emb_local(hidden_states, positions)
-        for layer in self.layers:
-            layer_outputs = layer(
-                positions=positions,
-                position_embeddings_global=position_embeddings_global,
-                position_embeddings_local=position_embeddings_local,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-                **kwargs,
-            )
-            hidden_states = layer_outputs[0]
+        num_layers = len(self.layers)
+        if _is_cpu and _is_cpu_amx_available:
+            for i, layer in enumerate(self.layers):
+                if i in self.layers_to_capture:
+                    aux_hidden_states.append(hidden_states)
+                layer_outputs = layer(
+                    positions=positions,
+                    position_embeddings_global=None,
+                    position_embeddings_local=None,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                    **kwargs,
+                )
+                hidden_states = layer_outputs[0]
+        else:
+            if positions.dim() == 1:
+                positions = einops.rearrange(positions, "s -> 1 s")
+
+            position_embeddings_global = self.rotary_emb(hidden_states, positions)
+            position_embeddings_local = self.rotary_emb_local(hidden_states, positions)
+            for i, layer in enumerate(self.layers):
+                if i in self.layers_to_capture:
+                    aux_hidden_states.append(hidden_states)
+                layer_outputs = layer(
+                    positions=positions,
+                    position_embeddings_global=position_embeddings_global,
+                    position_embeddings_local=position_embeddings_local,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                    **kwargs,
+                )
+                hidden_states = layer_outputs[0]
+
+        # Capture the output of the last layer if requested.
+        # layers_to_capture uses +1 offset (captures input of layer i = output of i-1),
+        # so index num_layers means the output of the final layer.
+        if num_layers in self.layers_to_capture:
+            aux_hidden_states.append(hidden_states)
 
         hidden_states = self.norm(hidden_states)
 
-        return hidden_states
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+
+        return hidden_states, aux_hidden_states
 
 
 class Gemma3ForCausalLM(PreTrainedModel):
@@ -651,6 +745,7 @@ class Gemma3ForCausalLM(PreTrainedModel):
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
             )
+        self.capture_aux_hidden_states = False
         self.post_init()
 
     def get_input_embeddings(self) -> nn.Embedding:
@@ -675,8 +770,16 @@ class Gemma3ForCausalLM(PreTrainedModel):
             input_ids, positions, forward_batch, input_embeds, **kwargs
         )
 
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
         return self.logits_processor(
-            input_ids, hidden_states, self.model.embed_tokens, forward_batch
+            input_ids,
+            hidden_states,
+            self.model.embed_tokens,
+            forward_batch,
+            aux_hidden_states,
         )
 
     @torch.no_grad()
@@ -754,6 +857,16 @@ class Gemma3ForCausalLM(PreTrainedModel):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
+            remapped_name = maybe_remap_kv_scale_name(name, params_dict)
+            if remapped_name is None:
+                continue
+            if remapped_name != name:
+                param = params_dict[remapped_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_params.add(remapped_name)
+                continue
+
             for param_name, shard_name, shard_id in stacked_params_mapping:
                 # if param_name in name:
                 # print(f"{param_name} is already in {name}")
@@ -790,6 +903,39 @@ class Gemma3ForCausalLM(PreTrainedModel):
         #         "Some weights are not initialized from checkpoints: %s", unloaded_params
         #     )
         return loaded_params
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        if layer_ids is None:
+            self.capture_aux_hidden_states = True
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
+        else:
+            self.capture_aux_hidden_states = True
+            # we plus 1 here because in sglang, for the ith layer, it takes the output
+            # of the (i-1)th layer as aux hidden state
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+    def _shard_weight(self, weight: torch.Tensor) -> torch.Tensor:
+        """Shard a full embedding/lm_head weight along vocab dim for the current TP rank.
+
+        Gemma3 uses nn.Embedding (unsharded) but the Eagle3 draft model uses
+        VocabParallelEmbedding (sharded). This method extracts the correct
+        shard so the weights can be shared.
+        """
+        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size <= 1:
+            return weight
+        tp_rank = get_tensor_model_parallel_rank()
+        shard_size = (weight.shape[0] + tp_size - 1) // tp_size
+        return weight[tp_rank * shard_size : (tp_rank + 1) * shard_size]
+
+    def get_embed(self):
+        return self._shard_weight(self.model.embed_tokens.weight)
+
+    def get_embed_and_head(self):
+        embed = self._shard_weight(self.model.embed_tokens.weight)
+        head = self._shard_weight(self.lm_head.weight)
+        return embed, head
 
 
 EntryClass = Gemma3ForCausalLM
