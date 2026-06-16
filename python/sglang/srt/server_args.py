@@ -657,6 +657,7 @@ class ServerArgs:
     ] = "none"
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
+    gpt_oss_expert_filter_threshold: float = 0.0
     enable_flashinfer_allreduce_fusion: bool = False
     enforce_disable_flashinfer_allreduce_fusion: bool = False
     enable_aiter_allreduce_fusion: bool = False
@@ -948,6 +949,10 @@ class ServerArgs:
         # defaults inspect enable_prefill_cp/cp_strategy.
         self._handle_legacy_cp_arguments()
         self._validate_prefill_only_disable_kv_cache_args()
+        if not 0.0 <= self.gpt_oss_expert_filter_threshold <= 1.0:
+            raise ValueError(
+                "--gpt-oss-expert-filter-threshold must be in the range [0, 1]."
+            )
 
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
@@ -1039,6 +1044,16 @@ class ServerArgs:
 
         # Handle MoE configurations.
         self._handle_moe_kernel_config()
+        if (
+            self.gpt_oss_expert_filter_threshold > 0
+            and self.moe_runner_backend != "triton"
+        ):
+            raise ValueError(
+                "--gpt-oss-expert-filter-threshold currently requires "
+                "--moe-runner-backend triton because it relies on standard TopK "
+                "outputs and the SGLang Triton MoE -1 expert sentinel. "
+                f"Got --moe-runner-backend {self.moe_runner_backend!r}."
+            )
         self._handle_a2a_moe()
         self._handle_eplb_and_dispatch()
         self._handle_expert_distribution_metrics()
@@ -6299,6 +6314,15 @@ class ServerArgs:
             choices=["default", "bf16"],
             default=ServerArgs.flashinfer_mxfp4_moe_precision,
             help="Choose the computation precision of flashinfer mxfp4 moe",
+        )
+        parser.add_argument(
+            "--gpt-oss-expert-filter-threshold",
+            type=float,
+            default=ServerArgs.gpt_oss_expert_filter_threshold,
+            help=(
+                "Drop GPT-OSS selected MoE expert slots whose normalized top-k "
+                "routing weight is below this threshold. Disabled when <= 0."
+            ),
         )
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",

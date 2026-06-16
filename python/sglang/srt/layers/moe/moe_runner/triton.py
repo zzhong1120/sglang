@@ -84,10 +84,12 @@ class TritonRunnerCore(MoeRunnerCore):
         from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
             _fused_moe_kernel_sequence,
         )
+        from sglang.srt.server_args import get_global_server_args
 
         filter_expert = (
             self.config.num_experts is None
             or self.config.num_experts != self.config.num_local_experts
+            or get_global_server_args().gpt_oss_expert_filter_threshold > 0
         )
 
         out = _fused_moe_kernel_sequence(

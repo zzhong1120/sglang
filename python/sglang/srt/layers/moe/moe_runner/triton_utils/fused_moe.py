@@ -245,6 +245,7 @@ def fused_experts(
     filter_expert = (
         moe_runner_config.num_experts is None
         or moe_runner_config.num_experts != moe_runner_config.num_local_experts
+        or get_global_server_args().gpt_oss_expert_filter_threshold > 0
     )
     if moe_runner_config.inplace:
         assert not moe_runner_config.no_combine, "no combine + inplace makes no sense"

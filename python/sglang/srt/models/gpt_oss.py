@@ -55,7 +55,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TopKOutput
 from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import dequant_mxfp4
@@ -121,6 +121,32 @@ class GptOssConfig(PretrainedConfig):
 
 
 logger = logging.getLogger(__name__)
+
+
+def apply_gpt_oss_expert_filter(
+    topk_output: TopKOutput,
+    threshold: float,
+) -> TopKOutput:
+    """Filter low-probability GPT-OSS expert slots using SGLang's -1 sentinel."""
+    if threshold <= 0:
+        return topk_output
+    if not isinstance(topk_output, StandardTopKOutput):
+        raise ValueError(
+            "GPT-OSS expert filtering requires standard TopK output. "
+            "Use the Triton MoE runner path or disable "
+            "--gpt-oss-expert-filter-threshold."
+        )
+
+    topk_weights = topk_output.topk_weights
+    topk_ids = topk_output.topk_ids
+    filter_mask = topk_weights < threshold
+
+    topk_weights = topk_weights.masked_fill(filter_mask, 0.0)
+    topk_ids = topk_ids.masked_fill(filter_mask, -1)
+    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp(
+        min=1e-6
+    )
+    return StandardTopKOutput(topk_weights, topk_ids, topk_output.router_logits)
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -305,6 +331,10 @@ class GptOssSparseMoeBlock(nn.Module):
         else:
             router_logits, _ = self.router(router_input)
             topk_output = self.topk(router_input, router_logits)
+            topk_output = apply_gpt_oss_expert_filter(
+                topk_output,
+                get_global_server_args().gpt_oss_expert_filter_threshold,
+            )
             final_hidden_states = self.experts(hidden_states, topk_output)
 
         if self.tp_size > 1 and not should_allreduce_fusion:
